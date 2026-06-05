@@ -1,0 +1,12 @@
+.next/
+.wrangler/
+apps/worker/.local/
+coverage/
+dist/
+node_modules/
+*.log
+*.local
+.env
+.env.*
+!.env.example
+npm-debug.log*

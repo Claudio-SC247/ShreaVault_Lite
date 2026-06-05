@@ -1,0 +1,24 @@
+{
+  "name": "sharevault-lite",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/web",
+    "apps/worker"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev-local.mjs",
+    "dev:local": "node scripts/dev-local.mjs",
+    "dev:web": "npm run dev --workspace @sharevault/web",
+    "dev:api-local": "npm run dev:local --workspace @sharevault/worker",
+    "dev:worker": "npm run dev --workspace @sharevault/worker",
+    "smoke:local": "node scripts/smoke-local.mjs",
+    "lint": "npm run lint --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  }
+}

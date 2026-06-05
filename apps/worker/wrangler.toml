@@ -1,0 +1,17 @@
+name = "sharevault-lite-api"
+main = "src/index.ts"
+compatibility_date = "2026-06-03"
+
+[vars]
+PUBLIC_BASE_URL = "http://localhost:8787"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sharevault-lite"
+database_id = "replace-with-cloudflare-d1-database-id"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "sharevault-lite-files"
+
