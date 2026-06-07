@@ -9,25 +9,20 @@ import {
   Loader2,
   RefreshCw,
   ShieldCheck,
+  Trash2,
   UploadCloud
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   EXPIRATION_OPTIONS,
   ShareRecord,
+  SharesResponse,
   buildApiUrl,
   formatBytes,
+  getAdminAuthHeaders,
   normalizeApiBaseUrl,
   resolveStatus
 } from "@/lib/share";
-
-type UploadResponse = {
-  share: ShareRecord;
-};
-
-type SharesResponse = {
-  shares: ShareRecord[];
-};
 
 const statusStyles: Record<ShareRecord["status"], string> = {
   active: "border-pine/20 bg-pine/10 text-pine",
@@ -41,40 +36,62 @@ const statusLabels: Record<ShareRecord["status"], string> = {
   revoked: "Revocado"
 };
 
+type UploadResponse = {
+  share: ShareRecord;
+};
+
 export function ShareVaultApp() {
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [apiBase, setApiBase] = useState(() => normalizeApiBaseUrl(process.env.NEXT_PUBLIC_API_BASE_URL));
+  const apiBase = useMemo(() => normalizeApiBaseUrl(process.env.NEXT_PUBLIC_API_BASE_URL), []);
+  const adminHeaders = useMemo(() => getAdminAuthHeaders(), []);
   const [expirationHours, setExpirationHours] = useState("24");
   const [shares, setShares] = useState<ShareRecord[]>([]);
+  const [nextCursor, setNextCursor] = useState<number | null>(null);
   const [lastShare, setLastShare] = useState<ShareRecord | null>(null);
   const [loadingShares, setLoadingShares] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [revokingId, setRevokingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const normalizedApiBase = useMemo(() => normalizeApiBaseUrl(apiBase), [apiBase]);
-
-  const loadShares = useCallback(async () => {
-    setLoadingShares(true);
-    setError(null);
-
-    try {
-      const response = await fetch(buildApiUrl(normalizedApiBase, "/api/shares"), {
-        cache: "no-store"
-      });
-
-      if (!response.ok) {
-        throw new Error("No se pudieron cargar los enlaces.");
+  const loadShares = useCallback(
+    async (cursor?: number | null, append = false) => {
+      if (append) {
+        setLoadingMore(true);
+      } else {
+        setLoadingShares(true);
       }
+      setError(null);
 
-      const data = (await response.json()) as SharesResponse;
-      setShares(data.shares.map((share) => ({ ...share, status: resolveStatus(share) })));
-    } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Error inesperado.");
-    } finally {
-      setLoadingShares(false);
-    }
-  }, [normalizedApiBase]);
+      try {
+        const path =
+          cursor != null
+            ? `/api/shares?limit=50&cursor=${encodeURIComponent(String(cursor))}`
+            : "/api/shares?limit=50";
+        const response = await fetch(buildApiUrl(apiBase, path), {
+          cache: "no-store",
+          headers: adminHeaders
+        });
+
+        if (!response.ok) {
+          throw new Error("No se pudieron cargar los enlaces.");
+        }
+
+        const data = (await response.json()) as SharesResponse;
+        const normalizedShares = data.shares.map((share) => ({ ...share, status: resolveStatus(share) }));
+
+        setShares((current) => (append ? [...current, ...normalizedShares] : normalizedShares));
+        setNextCursor(data.nextCursor);
+      } catch (loadError) {
+        setError(loadError instanceof Error ? loadError.message : "Error inesperado.");
+      } finally {
+        setLoadingShares(false);
+        setLoadingMore(false);
+      }
+    },
+    [adminHeaders, apiBase]
+  );
 
   useEffect(() => {
     void loadShares();
@@ -90,8 +107,9 @@ export function ShareVaultApp() {
     form.set("expiresInHours", expirationHours);
 
     try {
-      const response = await fetch(buildApiUrl(normalizedApiBase, "/api/files"), {
+      const response = await fetch(buildApiUrl(apiBase, "/api/files"), {
         method: "POST",
+        headers: adminHeaders,
         body: form
       });
 
@@ -119,8 +137,9 @@ export function ShareVaultApp() {
     setError(null);
 
     try {
-      const response = await fetch(buildApiUrl(normalizedApiBase, `/api/shares/${id}/revoke`), {
-        method: "POST"
+      const response = await fetch(buildApiUrl(apiBase, `/api/shares/${id}/revoke`), {
+        method: "POST",
+        headers: adminHeaders
       });
 
       const data = (await response.json()) as { error?: string };
@@ -136,6 +155,37 @@ export function ShareVaultApp() {
     }
   }
 
+  async function deleteShare(id: string, fileName: string) {
+    if (!window.confirm(`Eliminar "${fileName}" y su archivo asociado?`)) {
+      return;
+    }
+
+    setDeletingId(id);
+    setError(null);
+
+    try {
+      const response = await fetch(buildApiUrl(apiBase, `/api/shares/${id}`), {
+        method: "DELETE",
+        headers: adminHeaders
+      });
+
+      const data = (await response.json()) as { error?: string };
+      if (!response.ok) {
+        throw new Error(data.error ?? "No se pudo eliminar el enlace.");
+      }
+
+      if (lastShare?.id === id) {
+        setLastShare(null);
+      }
+
+      await loadShares();
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "Error inesperado.");
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-6 px-4 py-5 sm:px-6 lg:px-8">
       <header className="flex flex-col gap-4 border-b border-slate-200 pb-5 md:flex-row md:items-end md:justify-between">
@@ -146,15 +196,6 @@ export function ShareVaultApp() {
           </div>
           <h1 className="mt-2 text-3xl font-semibold text-ink">Archivos compartidos</h1>
         </div>
-        <label className="flex w-full max-w-xl flex-col gap-2 text-sm font-medium text-slate-700 md:w-[28rem]">
-          API
-          <input
-            className="h-11 rounded-md border border-slate-300 bg-white px-3 text-sm text-ink outline-none transition focus:border-pine focus:ring-2 focus:ring-pine/20"
-            value={apiBase}
-            onChange={(event) => setApiBase(event.target.value)}
-            spellCheck={false}
-          />
-        </label>
       </header>
 
       {error ? (
@@ -315,6 +356,16 @@ export function ShareVaultApp() {
                               {revokingId === share.id ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : <Ban className="h-4 w-4" aria-hidden="true" />}
                               <span className="sr-only">Revocar</span>
                             </button>
+                            <button
+                              className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-slate-300 text-slate-700 transition hover:border-coral hover:text-coral disabled:border-slate-200 disabled:text-slate-300"
+                              type="button"
+                              onClick={() => void deleteShare(share.id, share.fileName)}
+                              disabled={deletingId === share.id}
+                              title="Eliminar"
+                            >
+                              {deletingId === share.id ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : <Trash2 className="h-4 w-4" aria-hidden="true" />}
+                              <span className="sr-only">Eliminar</span>
+                            </button>
                           </div>
                         </td>
                       </tr>
@@ -324,6 +375,19 @@ export function ShareVaultApp() {
               </tbody>
             </table>
           </div>
+          {nextCursor ? (
+            <div className="border-t border-slate-200 p-5">
+              <button
+                className="inline-flex h-10 items-center justify-center rounded-md border border-slate-300 px-4 text-sm font-semibold text-ink transition hover:border-pine hover:text-pine disabled:text-slate-400"
+                type="button"
+                onClick={() => void loadShares(nextCursor, true)}
+                disabled={loadingMore}
+              >
+                {loadingMore ? <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" /> : null}
+                Cargar mas
+              </button>
+            </div>
+          ) : null}
         </section>
       </section>
     </main>

@@ -21,6 +21,11 @@ export type ShareRecord = {
   shareUrl: string;
 };
 
+export type SharesResponse = {
+  shares: ShareRecord[];
+  nextCursor: number | null;
+};
+
 export function normalizeApiBaseUrl(value: string | undefined | null): string {
   const trimmed = value?.trim();
   if (!trimmed) {
@@ -34,6 +39,17 @@ export function buildApiUrl(baseUrl: string, path: string): string {
   const normalizedBase = normalizeApiBaseUrl(baseUrl);
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   return `${normalizedBase}${normalizedPath}`;
+}
+
+export function getAdminAuthHeaders(): HeadersInit {
+  const key = process.env.NEXT_PUBLIC_ADMIN_API_KEY?.trim();
+  if (!key) {
+    return {};
+  }
+
+  return {
+    authorization: `Bearer ${key}`
+  };
 }
 
 export function formatBytes(bytes: number): string {
@@ -61,4 +77,43 @@ export function resolveStatus(
   }
 
   return "active";
+}
+
+export type SharePreviewMode = "image" | "pdf" | "text" | "download";
+
+export function resolveSharePreviewMode(mimeType: string): SharePreviewMode {
+  const normalized = mimeType.toLowerCase();
+
+  if (normalized.startsWith("image/")) {
+    return "image";
+  }
+
+  if (normalized === "application/pdf") {
+    return "pdf";
+  }
+
+  if (normalized.startsWith("text/")) {
+    return "text";
+  }
+
+  return "download";
+}
+
+export function extractFileName(contentDisposition: string | null, fallback: string): string {
+  if (!contentDisposition) {
+    return fallback;
+  }
+
+  const match = /filename="([^"]+)"/i.exec(contentDisposition);
+  return match?.[1] ?? fallback;
+}
+
+export function extractShareToken(shareUrl: string): string | null {
+  try {
+    const pathname = new URL(shareUrl).pathname;
+    const token = pathname.split("/").filter(Boolean).at(-1);
+    return token || null;
+  } catch {
+    return null;
+  }
 }

@@ -11,7 +11,8 @@ MVP personal para compartir archivos mediante enlaces privados temporales. El pr
 - Generar enlaces privados temporales.
 - Establecer expiracion por 1 h, 24 h, 3 dias o 7 dias.
 - Revocar acceso.
-- Visualizar archivos compartidos desde el enlace privado.
+- Eliminar enlaces y archivos asociados.
+- Visualizar archivos compartidos desde la pagina `/share/:token`.
 
 No incluye autenticacion social, pagos, chat ni notificaciones.
 
@@ -33,7 +34,25 @@ La API local queda en `http://localhost:8787` y guarda datos temporales en `apps
 
 `npm run dev:api-local` usa un servidor local compatible con el Worker para probar el MVP sin depender de R2/D1 reales. `npm run dev:worker` queda disponible para probar con Wrangler y recursos de Cloudflare.
 
-La app web usa `NEXT_PUBLIC_API_BASE_URL`; por defecto apunta a `http://localhost:8787`.
+### Variables de entorno (web)
+
+Copia `apps/web/.env.example` a `apps/web/.env.local`:
+
+| Variable | Descripcion |
+| --- | --- |
+| `NEXT_PUBLIC_API_BASE_URL` | URL del Worker/API (`http://localhost:8787` en local) |
+| `NEXT_PUBLIC_ADMIN_API_KEY` | Clave admin enviada como `Authorization: Bearer ...` |
+
+En local, el servidor embebido usa `dev-admin-key` por defecto si no defines otra clave.
+
+### Variables de entorno (worker)
+
+| Variable | Descripcion |
+| --- | --- |
+| `PUBLIC_BASE_URL` | URL publica del frontend usada para construir `shareUrl` |
+| `CORS_ORIGIN` | Origen permitido en produccion (localhost siempre permitido en dev) |
+| `ADMIN_API_KEY` | Secreto para endpoints administrativos |
+| `MAX_UPLOAD_BYTES` | Limite configurable (maximo 25 MB) |
 
 Para validar el flujo local principal con la API encendida:
 
@@ -58,27 +77,44 @@ npx wrangler d1 create sharevault-lite
 npx wrangler r2 bucket create sharevault-lite-files
 ```
 
-2. Copiar el `database_id` generado en `apps/worker/wrangler.toml`.
+2. Copiar el `database_id` generado en `apps/worker/wrangler.toml` (reemplaza el UUID de desarrollo).
 
-3. Aplicar la migracion:
+3. Configurar variables en `apps/worker/wrangler.toml`:
+
+- `PUBLIC_BASE_URL`: URL del frontend desplegado (ej. `https://app.tudominio.com`).
+- `CORS_ORIGIN`: mismo origen del frontend.
+
+4. Configurar el secreto admin del Worker:
 
 ```bash
 cd apps/worker
+npx wrangler secret put ADMIN_API_KEY
+```
+
+5. Aplicar la migracion:
+
+```bash
 npx wrangler d1 migrations apply sharevault-lite --remote
 ```
 
-4. Desplegar el Worker:
+6. Desplegar el Worker:
 
 ```bash
 npm run deploy --workspace @sharevault/worker
 ```
 
-5. Configurar `NEXT_PUBLIC_API_BASE_URL` en el hosting del frontend con la URL del Worker desplegado.
+7. Configurar el frontend:
 
-6. Desplegar el frontend Next.js en el proveedor elegido.
+- `NEXT_PUBLIC_API_BASE_URL`: URL del Worker desplegado.
+- `NEXT_PUBLIC_ADMIN_API_KEY`: misma clave definida como secreto en el Worker.
+
+8. Desplegar el frontend Next.js en el proveedor elegido.
 
 ## Seguridad
 
+- Endpoints administrativos (`POST /api/files`, `GET /api/shares`, revocar, eliminar) requieren `Authorization: Bearer <ADMIN_API_KEY>`.
+- `GET /api/health` y `GET /share/:token` permanecen publicos para visitantes.
+- CORS restringido por `CORS_ORIGIN`; no se usa `*` en produccion.
 - El Worker valida tamano y tipo MIME antes de guardar en R2.
 - Los nombres de archivo se sanitizan antes de persistirlos.
 - Los enlaces usan tokens aleatorios y no exponen claves internas de R2.

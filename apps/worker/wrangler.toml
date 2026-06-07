@@ -3,15 +3,23 @@ main = "src/index.ts"
 compatibility_date = "2026-06-03"
 
 [vars]
-PUBLIC_BASE_URL = "http://localhost:8787"
+# URL publica del frontend usada para construir shareUrl (no la URL del Worker).
+PUBLIC_BASE_URL = "http://localhost:3000"
+CORS_ORIGIN = "http://localhost:3000"
+MAX_UPLOAD_BYTES = "26214400"
+
+# ADMIN_API_KEY: configurar como secreto antes de desplegar:
+#   npx wrangler secret put ADMIN_API_KEY
 
 [[d1_databases]]
 binding = "DB"
 database_name = "sharevault-lite"
-database_id = "replace-with-cloudflare-d1-database-id"
+# Antes de `wrangler deploy`, crear la base y pegar el id devuelto:
+#   npx wrangler d1 create sharevault-lite
+# Para `wrangler dev --local`, cualquier UUID valido funciona.
+database_id = "00000000-0000-0000-0000-000000000001"
 migrations_dir = "migrations"
 
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "sharevault-lite-files"
-

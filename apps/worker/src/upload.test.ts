@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import worker, { Env, ShareRow } from "./index";
 
+const ADMIN_API_KEY = "test-admin-key";
+
+function adminHeaders(): HeadersInit {
+  return {
+    authorization: `Bearer ${ADMIN_API_KEY}`
+  };
+}
+
 function createUploadEnv() {
   const bindCalls: unknown[][] = [];
   const putCalls: Array<[string, unknown, unknown]> = [];
@@ -22,6 +30,7 @@ function createUploadEnv() {
     DB: {
       prepare
     },
+    ADMIN_API_KEY,
     MAX_UPLOAD_BYTES: "1048576",
     PUBLIC_BASE_URL: "https://files.example.com"
   } as unknown as Env;
@@ -72,9 +81,11 @@ function createShareEnv(row: ShareRow | null) {
 
 function createListEnv(rows: ShareRow[]) {
   const all = vi.fn(async () => ({ results: rows }));
-  const prepare = vi.fn(() => ({ all }));
+  const bind = vi.fn(() => ({ all }));
+  const prepare = vi.fn(() => ({ bind, all }));
 
   const env = {
+    ADMIN_API_KEY,
     DB: {
       prepare
     },
@@ -83,6 +94,7 @@ function createListEnv(rows: ShareRow[]) {
 
   return {
     all,
+    bind,
     env,
     prepare
   };
@@ -95,6 +107,7 @@ function createRevokeEnv(row: Pick<ShareRow, "revoked_at"> | null) {
   const prepare = vi.fn(() => ({ bind }));
 
   const env = {
+    ADMIN_API_KEY,
     DB: {
       prepare
     }
@@ -102,6 +115,33 @@ function createRevokeEnv(row: Pick<ShareRow, "revoked_at"> | null) {
 
   return {
     bind,
+    env,
+    first,
+    prepare,
+    run
+  };
+}
+
+function createDeleteEnv(row: Pick<ShareRow, "object_key"> | null) {
+  const first = vi.fn(async () => row);
+  const run = vi.fn(async () => ({ meta: { changes: 1 } }));
+  const bind = vi.fn(() => ({ first, run }));
+  const prepare = vi.fn(() => ({ bind }));
+  const del = vi.fn(async () => null);
+
+  const env = {
+    ADMIN_API_KEY,
+    BUCKET: {
+      delete: del
+    },
+    DB: {
+      prepare
+    }
+  } as unknown as Env;
+
+  return {
+    bind,
+    del,
     env,
     first,
     prepare,
@@ -135,6 +175,7 @@ describe("file upload", () => {
     const response = await worker.fetch(
       new Request("https://api.example.com/api/files", {
         body: form,
+        headers: adminHeaders(),
         method: "POST"
       }),
       env
@@ -196,6 +237,7 @@ describe("file upload", () => {
       const response = await worker.fetch(
         new Request("https://api.example.com/api/files", {
           body: form,
+          headers: adminHeaders(),
           method: "POST"
         }),
         env
@@ -220,6 +262,7 @@ describe("file upload", () => {
     const response = await worker.fetch(
       new Request("https://api.example.com/api/files", {
         body: form,
+        headers: adminHeaders(),
         method: "POST"
       }),
       env
@@ -240,6 +283,7 @@ describe("file upload", () => {
     const response = await worker.fetch(
       new Request("https://api.example.com/api/files", {
         body: form,
+        headers: adminHeaders(),
         method: "POST"
       }),
       env
@@ -344,6 +388,7 @@ describe("revocation", () => {
 
       const response = await worker.fetch(
         new Request("https://api.example.com/api/shares/share-1/revoke", {
+          headers: adminHeaders(),
           method: "POST"
         }),
         env
@@ -367,6 +412,7 @@ describe("revocation", () => {
 
     const response = await worker.fetch(
       new Request("https://api.example.com/api/shares/share-1/revoke", {
+        headers: adminHeaders(),
         method: "POST"
       }),
       env
@@ -383,6 +429,7 @@ describe("revocation", () => {
 
     const response = await worker.fetch(
       new Request("https://api.example.com/api/shares/missing/revoke", {
+        headers: adminHeaders(),
         method: "POST"
       }),
       env
@@ -391,6 +438,49 @@ describe("revocation", () => {
 
     expect(response.status).toBe(404);
     expect(data.error).toBe("Enlace no encontrado.");
+    expect(run).not.toHaveBeenCalled();
+  });
+});
+
+describe("deletion", () => {
+  it("removes the R2 object and D1 row for an existing share", async () => {
+    const { bind, del, env, first, prepare, run } = createDeleteEnv({
+      object_key: "shares/share-1/contrato.txt"
+    });
+
+    const response = await worker.fetch(
+      new Request("https://api.example.com/api/shares/share-1", {
+        headers: adminHeaders(),
+        method: "DELETE"
+      }),
+      env
+    );
+    const data = (await response.json()) as { deleted: boolean };
+
+    expect(response.status).toBe(200);
+    expect(data.deleted).toBe(true);
+    expect(prepare).toHaveBeenCalledTimes(2);
+    expect(first).toHaveBeenCalledOnce();
+    expect(del).toHaveBeenCalledWith("shares/share-1/contrato.txt");
+    expect(run).toHaveBeenCalledOnce();
+    expect(bind).toHaveBeenLastCalledWith("share-1");
+  });
+
+  it("returns 404 when deleting an unknown share", async () => {
+    const { del, env, run } = createDeleteEnv(null);
+
+    const response = await worker.fetch(
+      new Request("https://api.example.com/api/shares/missing", {
+        headers: adminHeaders(),
+        method: "DELETE"
+      }),
+      env
+    );
+    const data = (await response.json()) as { error: string };
+
+    expect(response.status).toBe(404);
+    expect(data.error).toBe("Enlace no encontrado.");
+    expect(del).not.toHaveBeenCalled();
     expect(run).not.toHaveBeenCalled();
   });
 });
@@ -420,7 +510,12 @@ describe("share listing", () => {
         })
       ]);
 
-      const response = await worker.fetch(new Request("https://api.example.com/api/shares"), env);
+      const response = await worker.fetch(
+        new Request("https://api.example.com/api/shares", {
+          headers: adminHeaders()
+        }),
+        env
+      );
       const data = (await response.json()) as { shares: Array<{ id: string; status: string }> };
 
       expect(response.status).toBe(200);
@@ -432,5 +527,31 @@ describe("share listing", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("admin protection", () => {
+  it("returns 401 for admin endpoints without credentials", async () => {
+    const { env } = createUploadEnv();
+
+    const response = await worker.fetch(new Request("https://api.example.com/api/shares"), env);
+    const data = (await response.json()) as { error: string };
+
+    expect(response.status).toBe(401);
+    expect(data.error).toBe("No autorizado.");
+  });
+
+  it("keeps health and public share routes accessible without admin auth", async () => {
+    const { env } = createShareEnv(
+      createShareRow({
+        expires_at: Date.now() + 60 * 60 * 1000
+      })
+    );
+
+    const health = await worker.fetch(new Request("https://api.example.com/api/health"), env);
+    const share = await worker.fetch(new Request("https://api.example.com/share/token-1"), env);
+
+    expect(health.status).toBe(200);
+    expect(share.status).toBe(200);
   });
 });

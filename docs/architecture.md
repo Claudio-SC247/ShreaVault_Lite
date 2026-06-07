@@ -13,8 +13,12 @@ proyecto/
 |   |   |   |   +-- globals.css
 |   |   |   |   +-- layout.tsx
 |   |   |   |   +-- page.tsx
+|   |   |   |   +-- share/
+|   |   |   |       +-- [token]/
+|   |   |   |           +-- page.tsx
 |   |   |   +-- components/
 |   |   |   |   +-- share-vault-app.tsx
+|   |   |   |   +-- share-viewer.tsx
 |   |   |   +-- lib/
 |   |   |       +-- share.ts
 |   |   |       +-- share.test.ts
@@ -30,6 +34,10 @@ proyecto/
 |       |   +-- 0001_init.sql
 |       +-- src/
 |       |   +-- index.ts
+|       |   +-- auth.ts
+|       |   +-- cors.ts
+|       |   +-- rate-limit.ts
+|       |   +-- storage.ts
 |       |   +-- validation.ts
 |       |   +-- validation.test.ts
 |       +-- eslint.config.mjs
@@ -101,11 +109,18 @@ La clave R2 queda solo en D1. El cliente nunca recibe rutas internas de almacena
 
 ### Visualizar archivo compartido
 
-1. Una persona abre `/share/:token`.
-2. El Worker busca el token en D1.
-3. El Worker verifica que el enlace no este revocado ni expirado.
-4. El Worker obtiene el objeto desde R2.
-5. El Worker devuelve el archivo con headers seguros y sin exponer `object_key`.
+1. Una persona abre `/share/:token` en el frontend Next.js.
+2. La pagina obtiene el archivo desde `GET /share/:token` del Worker (sin exponer `object_key`).
+3. El Worker busca el token en D1 y valida expiracion/revocacion.
+4. El Worker obtiene el objeto desde R2 y lo devuelve con headers seguros.
+5. El frontend muestra vista previa para PDF, imagenes y texto; otros tipos ofrecen descarga.
+
+### Eliminar enlace
+
+1. El usuario confirma eliminacion en la lista.
+2. La web llama `DELETE /api/shares/:id` con auth admin.
+3. El Worker borra el objeto en R2 y la fila en D1.
+4. La web refresca la lista.
 
 ### Revocar enlace
 
@@ -117,12 +132,22 @@ La clave R2 queda solo en D1. El cliente nunca recibe rutas internas de almacena
 
 ### Listar enlaces
 
-1. La web llama `GET /api/shares`.
-2. El Worker obtiene los ultimos 100 registros.
+1. La web llama `GET /api/shares?limit=50&cursor=<created_at>` con auth admin.
+2. El Worker devuelve una pagina ordenada por `created_at DESC` y `nextCursor` si hay mas resultados.
 3. El Worker calcula el estado derivado.
-4. La web muestra archivo, tamano, expiracion, estado y acciones.
+4. La web muestra archivo, tamano, expiracion, estado y acciones; permite cargar mas.
 
 ## Endpoints
+
+### Autenticacion admin
+
+Endpoints administrativos requieren:
+
+```http
+Authorization: Bearer <ADMIN_API_KEY>
+```
+
+Endpoints publicos: `GET /api/health`, `GET /share/:token`.
 
 ### `GET /api/health`
 
@@ -138,7 +163,7 @@ Respuesta `200`:
 
 ### `POST /api/files`
 
-Crea un enlace privado temporal para un archivo.
+Crea un enlace privado temporal para un archivo. Requiere auth admin.
 
 Request:
 
@@ -167,19 +192,26 @@ Respuesta `201`:
     "createdAt": "2026-06-03T01:00:00.000Z",
     "revokedAt": null,
     "status": "active",
-    "shareUrl": "https://api.example.com/share/private-token"
+    "shareUrl": "https://app.example.com/share/private-token"
   }
 }
 ```
 
 Errores:
 
+- `401`: credenciales admin ausentes o invalidas.
 - `400`: archivo invalido, tipo no permitido o expiracion invalida.
+- `429`: rate limit excedido.
 - `500`: error inesperado al persistir en R2 o D1.
 
 ### `GET /api/shares`
 
-Lista los ultimos enlaces creados.
+Lista enlaces con paginacion por cursor (`created_at`). Requiere auth admin.
+
+Query params:
+
+- `limit`: 1-100, default 50.
+- `cursor`: timestamp `created_at` del ultimo item de la pagina anterior.
 
 Respuesta `200`:
 
@@ -195,15 +227,16 @@ Respuesta `200`:
       "createdAt": "2026-06-03T01:00:00.000Z",
       "revokedAt": null,
       "status": "active",
-      "shareUrl": "https://api.example.com/share/private-token"
+      "shareUrl": "https://app.example.com/share/private-token"
     }
-  ]
+  ],
+  "nextCursor": 1717376400000
 }
 ```
 
 ### `POST /api/shares/:id/revoke`
 
-Revoca un enlace por su `id` interno.
+Revoca un enlace por su `id` interno. Requiere auth admin.
 
 Respuesta `200`:
 
@@ -215,11 +248,29 @@ Respuesta `200`:
 
 Errores:
 
+- `401`: no autorizado.
+- `404`: enlace no encontrado.
+
+### `DELETE /api/shares/:id`
+
+Elimina el registro en D1 y el objeto en R2. Requiere auth admin.
+
+Respuesta `200`:
+
+```json
+{
+  "deleted": true
+}
+```
+
+Errores:
+
+- `401`: no autorizado.
 - `404`: enlace no encontrado.
 
 ### `GET /share/:token`
 
-Sirve el archivo si el token existe, no expiro y no fue revocado.
+Endpoint publico del Worker que sirve el archivo si el token existe, no expiro y no fue revocado.
 
 Respuesta `200`:
 
@@ -234,16 +285,19 @@ Errores:
 
 - `404`: token inexistente o archivo no disponible.
 - `410`: enlace expirado o revocado.
+- `429`: rate limit excedido.
 
 ## Reglas de seguridad
 
 - No guardar secretos en codigo ni en el repositorio.
+- Proteger endpoints administrativos con `ADMIN_API_KEY` via header `Authorization: Bearer`.
+- Restringir CORS con `CORS_ORIGIN`; localhost permitido en desarrollo local.
 - No exponer `object_key`, bucket, rutas internas ni configuracion Cloudflare al cliente.
 - Sanitizar nombres de archivo antes de persistirlos.
 - Validar tamano y MIME antes de escribir en R2.
 - Usar tokens aleatorios de alta entropia para enlaces privados.
 - Usar `cache-control: no-store` para respuestas sensibles.
-- Mantener CORS acotable por variable de entorno antes de produccion publica.
+- Rate limiting basico por IP para rutas admin y visualizacion publica.
 
 ## Variables y bindings
 
@@ -252,6 +306,7 @@ Errores:
 | Variable | Descripcion |
 | --- | --- |
 | `NEXT_PUBLIC_API_BASE_URL` | URL publica del Worker |
+| `NEXT_PUBLIC_ADMIN_API_KEY` | Clave admin para operaciones de panel |
 
 ### Worker
 
@@ -259,7 +314,9 @@ Errores:
 | --- | --- | --- |
 | `DB` | D1 | Base de datos de metadatos |
 | `BUCKET` | R2 | Bucket de archivos |
-| `PUBLIC_BASE_URL` | Variable | URL publica usada para construir enlaces |
+| `PUBLIC_BASE_URL` | Variable | URL publica del frontend para construir `shareUrl` |
+| `CORS_ORIGIN` | Variable | Origen permitido en produccion |
+| `ADMIN_API_KEY` | Secreto | Clave para endpoints administrativos |
 | `MAX_UPLOAD_BYTES` | Variable opcional | Limite configurable sin superar 25 MB |
 
 ## Fuera de alcance del MVP

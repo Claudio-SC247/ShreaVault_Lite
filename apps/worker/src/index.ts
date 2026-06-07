@@ -1,3 +1,6 @@
+import { isAdminAuthorized, unauthorizedResponse } from "./auth";
+import { withCors } from "./cors";
+import { checkRateLimit, getClientIp } from "./rate-limit";
 import {
   MAX_FILE_SIZE,
   ValidationError,
@@ -6,13 +9,15 @@ import {
   sanitizeFileName,
   validateFileInput
 } from "./validation";
-import { createObjectKey, storeUploadedFile } from "./storage";
+import { createObjectKey, deleteStoredFile, storeUploadedFile } from "./storage";
 
 export interface Env {
   DB: D1Database;
   BUCKET: R2Bucket;
   PUBLIC_BASE_URL?: string;
   MAX_UPLOAD_BYTES?: string;
+  ADMIN_API_KEY?: string;
+  CORS_ORIGIN?: string;
 }
 
 export type ShareRow = {
@@ -45,40 +50,40 @@ const JSON_HEADERS = {
   "cache-control": "no-store"
 };
 
-const CORS_HEADERS = {
-  "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET,POST,OPTIONS",
-  "access-control-allow-headers": "content-type"
-};
+const ADMIN_RATE_LIMIT = { limit: 60, windowMs: 60_000 };
+const SHARE_VIEW_RATE_LIMIT = { limit: 120, windowMs: 60_000 };
+const adminRateLimitStore = new Map<string, { count: number; resetAt: number }>();
+const shareViewRateLimitStore = new Map<string, { count: number; resetAt: number }>();
 
-function withCors(response: Response): Response {
-  const headers = new Headers(response.headers);
-  Object.entries(CORS_HEADERS).forEach(([key, value]) => headers.set(key, value));
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers
-  });
-}
-
-function json(data: unknown, init: ResponseInit = {}): Response {
+function json(request: Request, env: Env, data: unknown, init: ResponseInit = {}): Response {
   return withCors(
+    request,
     new Response(JSON.stringify(data), {
       ...init,
       headers: {
         ...JSON_HEADERS,
         ...init.headers
       }
-    })
+    }),
+    env.CORS_ORIGIN
   );
 }
 
-function errorResponse(message: string, status = 400): Response {
-  return json({ error: message }, { status });
+function errorResponse(request: Request, env: Env, message: string, status = 400): Response {
+  return json(request, env, { error: message }, { status });
 }
 
-function notFound(): Response {
-  return errorResponse("Ruta no encontrada.", 404);
+function notFound(request: Request, env: Env): Response {
+  return errorResponse(request, env, "Ruta no encontrada.", 404);
+}
+
+function rateLimitedResponse(request: Request, env: Env, retryAfterSeconds: number): Response {
+  return json(request, env, { error: "Demasiadas solicitudes. Intenta de nuevo mas tarde." }, {
+    status: 429,
+    headers: {
+      "retry-after": String(retryAfterSeconds)
+    }
+  });
 }
 
 function getPublicBaseUrl(request: Request, env: Env): string {
@@ -98,6 +103,19 @@ function createToken(): string {
 
 function escapeHeaderValue(value: string): string {
   return value.replace(/["\r\n]/g, "");
+}
+
+function requireAdmin(request: Request, env: Env): Response | null {
+  if (!isAdminAuthorized(request, env.ADMIN_API_KEY)) {
+    return withCors(request, unauthorizedResponse(), env.CORS_ORIGIN);
+  }
+
+  const rateLimit = checkRateLimit(`admin:${getClientIp(request)}`, ADMIN_RATE_LIMIT, adminRateLimitStore);
+  if (!rateLimit.allowed) {
+    return rateLimitedResponse(request, env, rateLimit.retryAfterSeconds);
+  }
+
+  return null;
 }
 
 export function toShareDto(row: ShareRow, request: Request, env: Env): ShareDto {
@@ -165,43 +183,106 @@ export async function createShare(request: Request, env: Env): Promise<Response>
     downloaded_at: null
   };
 
-  return json({ share: toShareDto(row, request, env) }, { status: 201 });
+  return json(request, env, { share: toShareDto(row, request, env) }, { status: 201 });
+}
+
+function parseListLimit(value: string | null): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 50;
+  }
+
+  return Math.min(Math.floor(parsed), 100);
+}
+
+function parseListCursor(value: string | null): number | null {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
 async function listShares(request: Request, env: Env): Promise<Response> {
-  const result = await env.DB.prepare(
-    `SELECT
-      id,
-      token,
-      file_name,
-      mime_type,
-      size,
-      object_key,
-      expires_at,
-      revoked_at,
-      created_at,
-      downloaded_at
-    FROM shares
-    ORDER BY created_at DESC
-    LIMIT 100`
-  ).all<ShareRow>();
+  const url = new URL(request.url);
+  const limit = parseListLimit(url.searchParams.get("limit"));
+  const cursor = parseListCursor(url.searchParams.get("cursor"));
+  const fetchLimit = limit + 1;
 
-  return json({
-    shares: (result.results ?? []).map((row) => toShareDto(row, request, env))
+  const statement = cursor
+    ? env.DB.prepare(
+        `SELECT
+          id,
+          token,
+          file_name,
+          mime_type,
+          size,
+          object_key,
+          expires_at,
+          revoked_at,
+          created_at,
+          downloaded_at
+        FROM shares
+        WHERE created_at < ?
+        ORDER BY created_at DESC
+        LIMIT ?`
+      ).bind(cursor, fetchLimit)
+    : env.DB.prepare(
+        `SELECT
+          id,
+          token,
+          file_name,
+          mime_type,
+          size,
+          object_key,
+          expires_at,
+          revoked_at,
+          created_at,
+          downloaded_at
+        FROM shares
+        ORDER BY created_at DESC
+        LIMIT ?`
+      ).bind(fetchLimit);
+
+  const result = await statement.all<ShareRow>();
+  const rows = result.results ?? [];
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+  const nextCursor = hasMore ? page[page.length - 1]?.created_at ?? null : null;
+
+  return json(request, env, {
+    shares: page.map((row) => toShareDto(row, request, env)),
+    nextCursor
   });
 }
 
-async function revokeShare(id: string, env: Env): Promise<Response> {
+async function deleteShare(request: Request, id: string, env: Env): Promise<Response> {
+  const row = await env.DB.prepare("SELECT object_key FROM shares WHERE id = ?")
+    .bind(id)
+    .first<Pick<ShareRow, "object_key">>();
+
+  if (!row) {
+    return errorResponse(request, env, "Enlace no encontrado.", 404);
+  }
+
+  await deleteStoredFile(env.BUCKET, row.object_key);
+  await env.DB.prepare("DELETE FROM shares WHERE id = ?").bind(id).run();
+
+  return json(request, env, { deleted: true });
+}
+
+async function revokeShare(request: Request, id: string, env: Env): Promise<Response> {
   const row = await env.DB.prepare("SELECT revoked_at FROM shares WHERE id = ?")
     .bind(id)
     .first<Pick<ShareRow, "revoked_at">>();
 
   if (!row) {
-    return errorResponse("Enlace no encontrado.", 404);
+    return errorResponse(request, env, "Enlace no encontrado.", 404);
   }
 
   if (row.revoked_at) {
-    return json({ revokedAt: new Date(row.revoked_at).toISOString() });
+    return json(request, env, { revokedAt: new Date(row.revoked_at).toISOString() });
   }
 
   const now = Date.now();
@@ -209,10 +290,15 @@ async function revokeShare(id: string, env: Env): Promise<Response> {
     .bind(now, id)
     .run();
 
-  return json({ revokedAt: new Date(now).toISOString() });
+  return json(request, env, { revokedAt: new Date(now).toISOString() });
 }
 
-async function viewShare(token: string, env: Env): Promise<Response> {
+async function viewShare(request: Request, token: string, env: Env): Promise<Response> {
+  const rateLimit = checkRateLimit(`share:${getClientIp(request)}`, SHARE_VIEW_RATE_LIMIT, shareViewRateLimitStore);
+  if (!rateLimit.allowed) {
+    return rateLimitedResponse(request, env, rateLimit.retryAfterSeconds);
+  }
+
   const row = await env.DB.prepare(
     `SELECT
       id,
@@ -232,7 +318,7 @@ async function viewShare(token: string, env: Env): Promise<Response> {
     .first<ShareRow>();
 
   if (!row) {
-    return errorResponse("Enlace no encontrado.", 404);
+    return errorResponse(request, env, "Enlace no encontrado.", 404);
   }
 
   const status = resolveShareStatus({
@@ -241,16 +327,16 @@ async function viewShare(token: string, env: Env): Promise<Response> {
   });
 
   if (status === "revoked") {
-    return errorResponse("El enlace fue revocado.", 410);
+    return errorResponse(request, env, "El enlace fue revocado.", 410);
   }
 
   if (status === "expired") {
-    return errorResponse("El enlace expiro.", 410);
+    return errorResponse(request, env, "El enlace expiro.", 410);
   }
 
   const object = await env.BUCKET.get(row.object_key);
   if (!object) {
-    return errorResponse("Archivo no disponible.", 404);
+    return errorResponse(request, env, "Archivo no disponible.", 404);
   }
 
   await env.DB.prepare("UPDATE shares SET downloaded_at = ? WHERE id = ?")
@@ -264,27 +350,51 @@ async function viewShare(token: string, env: Env): Promise<Response> {
   headers.set("cache-control", "private, no-store");
   headers.set("etag", object.httpEtag);
 
-  return withCors(new Response(object.body, { headers }));
+  return withCors(request, new Response(object.body, { headers }), env.CORS_ORIGIN);
 }
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (request.method === "OPTIONS") {
-    return withCors(new Response(null, { status: 204 }));
+    return withCors(request, new Response(null, { status: 204 }), env.CORS_ORIGIN);
   }
 
   const url = new URL(request.url);
   const pathParts = url.pathname.split("/").filter(Boolean);
 
   if (request.method === "GET" && url.pathname === "/api/health") {
-    return json({ ok: true });
+    return json(request, env, { ok: true });
   }
 
   if (request.method === "POST" && url.pathname === "/api/files") {
+    const authError = requireAdmin(request, env);
+    if (authError) {
+      return authError;
+    }
+
     return createShare(request, env);
   }
 
   if (request.method === "GET" && url.pathname === "/api/shares") {
+    const authError = requireAdmin(request, env);
+    if (authError) {
+      return authError;
+    }
+
     return listShares(request, env);
+  }
+
+  if (
+    request.method === "DELETE" &&
+    pathParts.length === 3 &&
+    pathParts[0] === "api" &&
+    pathParts[1] === "shares"
+  ) {
+    const authError = requireAdmin(request, env);
+    if (authError) {
+      return authError;
+    }
+
+    return deleteShare(request, pathParts[2], env);
   }
 
   if (
@@ -294,14 +404,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     pathParts[1] === "shares" &&
     pathParts[3] === "revoke"
   ) {
-    return revokeShare(pathParts[2], env);
+    const authError = requireAdmin(request, env);
+    if (authError) {
+      return authError;
+    }
+
+    return revokeShare(request, pathParts[2], env);
   }
 
   if (request.method === "GET" && pathParts.length === 2 && pathParts[0] === "share") {
-    return viewShare(pathParts[1], env);
+    return viewShare(request, pathParts[1], env);
   }
 
-  return notFound();
+  return notFound(request, env);
 }
 
 export default {
@@ -310,11 +425,11 @@ export default {
       return await handleRequest(request, env);
     } catch (error) {
       if (error instanceof ValidationError) {
-        return errorResponse(error.message, error.status);
+        return errorResponse(request, env, error.message, error.status);
       }
 
       console.error(error);
-      return errorResponse("Error interno.", 500);
+      return errorResponse(request, env, "Error interno.", 500);
     }
   }
 };

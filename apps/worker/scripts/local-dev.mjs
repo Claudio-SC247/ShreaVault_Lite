@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -41,14 +41,26 @@ function createD1Database() {
             async all() {
               const state = await loadState();
               if (sql.includes("FROM shares") && sql.includes("ORDER BY created_at DESC")) {
+                const sorted = [...state.shares].sort((a, b) => b.created_at - a.created_at);
+                const cursor = args[0];
+                const limit = args.length > 1 ? args[1] : args[0];
+                const filtered =
+                  typeof cursor === "number" && args.length > 1
+                    ? sorted.filter((share) => share.created_at < cursor)
+                    : sorted;
+                const pageLimit = typeof limit === "number" ? limit : 100;
                 return {
-                  results: [...state.shares].sort((a, b) => b.created_at - a.created_at).slice(0, 100)
+                  results: filtered.slice(0, pageLimit)
                 };
               }
               return { results: [] };
             },
             async first() {
               const state = await loadState();
+              if (sql.includes("SELECT object_key FROM shares WHERE id = ?")) {
+                const row = state.shares.find((share) => share.id === args[0]);
+                return row ? { object_key: row.object_key } : null;
+              }
               if (sql.includes("SELECT revoked_at FROM shares WHERE id = ?")) {
                 const row = state.shares.find((share) => share.id === args[0]);
                 return row ? { revoked_at: row.revoked_at } : null;
@@ -74,6 +86,13 @@ function createD1Database() {
                   created_at: createdAt,
                   downloaded_at: null
                 });
+                await saveState(state);
+                return { meta: { changes: 1 } };
+              }
+              if (sql.includes("DELETE FROM shares WHERE id = ?")) {
+                const index = state.shares.findIndex((share) => share.id === args[0]);
+                if (index === -1) return { meta: { changes: 0 } };
+                state.shares.splice(index, 1);
                 await saveState(state);
                 return { meta: { changes: 1 } };
               }
@@ -128,6 +147,15 @@ function createR2Bucket() {
       } catch {
         return null;
       }
+    },
+    async delete(key) {
+      try {
+        await unlink(objectPath(key));
+        await unlink(`${objectPath(key)}.json`);
+      } catch {
+        // Ignore missing objects during local cleanup.
+      }
+      return null;
     }
   };
 }
@@ -179,10 +207,16 @@ async function loadWorker() {
 
 const workerModule = await loadWorker();
 const worker = workerModule.default;
+const webBaseUrl = (process.env.PUBLIC_BASE_URL || process.env.SHAREVAULT_WEB_BASE_URL || "http://localhost:3000").replace(
+  /\/+$/,
+  ""
+);
 const env = {
+  ADMIN_API_KEY: process.env.ADMIN_API_KEY || "dev-admin-key",
   BUCKET: createR2Bucket(),
+  CORS_ORIGIN: process.env.CORS_ORIGIN || webBaseUrl,
   DB: createD1Database(),
-  PUBLIC_BASE_URL: `http://localhost:${port}`
+  PUBLIC_BASE_URL: webBaseUrl
 };
 
 const server = createServer(async (req, res) => {

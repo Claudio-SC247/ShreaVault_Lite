@@ -86,6 +86,7 @@ if (await isReachable(webUrl)) {
   log("web", `ya disponible en ${webUrl}`);
 } else {
   start("web", ["run", "dev:web"], {
+    NEXT_PUBLIC_ADMIN_API_KEY: process.env.ADMIN_API_KEY || "dev-admin-key",
     NEXT_PUBLIC_API_BASE_URL: apiUrl
   });
   await waitForUrl(webUrl, "web", 90000);
